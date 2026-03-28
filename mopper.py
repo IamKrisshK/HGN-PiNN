@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import math
 import torch_geometric as pyg
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -15,11 +17,14 @@ class FourierFeatureEncoder(nn.Module):
     def forward(self, x):
         x_proj = 2 * math.pi * x @ self.B
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-      
+
 def collate_fn(batch):
     if isinstance(batch[0], tuple):
         graphs, physics = zip(*batch)
-        return pyg.data.Batch.from_data_list(graphs), physics
+        physics_d = {}
+        for key in physics[0].keys():
+            physics_d[key] = torch.tensor([p[key] for p in physics])
+        return pyg.data.Batch.from_data_list(graphs), physics_d
     else:
         return pyg.data.Batch.from_data_list(batch)
 
@@ -43,6 +48,15 @@ class Mopper:
                 mapping_size=self.fourier_dim,
                 scale=self.fourier_scale,
             ).to(self.device)
+    def apply_fourier(self, graph):
+        if not self.use_fourier:
+            return graph
+        x = graph.x
+        coords = x[:, :self.coord_dim]
+        rest = x[:, self.coord_dim:]
+        coords_encoded = self.fourier(coords)
+        graph.x = torch.cat([coords_encoded, rest], dim=-1)
+        return graph
     def build_dataloader(self):
         self.logger.info("Initializing dataset...")
         dataset = HydroGraphDataset(
@@ -83,9 +97,11 @@ class Mopper:
         self.logger.info("Building MeshGraphKAN model...")
 
         mlp_act = "silu" if self.cfg.recompute_activation else "relu"
-
+        input_dim = self.cfg.num_input_features
+        if self.use_fourier:
+            input_dim = 2 * self.fourier_dim + (input_dim - self.coord_dim)
         model = MeshGraphKAN(
-            self.cfg.num_input_features,
+            input_dim,
             self.cfg.num_edge_features,
             self.cfg.num_output_features,
             mlp_activation_fn=mlp_act,

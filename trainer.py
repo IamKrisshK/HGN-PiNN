@@ -42,12 +42,27 @@ class trainer:
         self.model.to(self.device)
         self.model.train()
 
-    def step(self, batch):
-        self.optimizer.zero_grad(set_to_none=True)
+    def step(self, batch, step_idx):
+        if step_idx % self.cfg["grad_accum_steps"] == 0:
+            self.optimizer.zero_grad(set_to_none=True)
         loss, loss_dict = self.forward_step(batch)
+        loss = loss / self.cfg["grad_accum_steps"]
         self.backward(loss)
+        if (step_idx + 1) % self.cfg["grad_accum_steps"] == 0:
+            if self.amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
         return loss.detach(), loss_dict
-
+    def chunk_graph(self, graph, chunk_size=5000):
+        N = graph.num_nodes
+    
+        for i in range(0, N, chunk_size):
+            mask = torch.arange(i, min(i + chunk_size, N), device=graph.x.device)
+            subgraph = graph.subgraph(mask)
+            yield subgraph
+            
     def forward_step(self, batch):
         if self.use_physics:
             graph, physics = batch
@@ -56,19 +71,21 @@ class trainer:
             graph = batch
             physics = None
 
-        graph = graph.to(self.device)
+        graph = graph.to(self.device, non_blocking=True)
         if hasattr(self, "wrapper"):
             graph = self.wrapper.apply_fourier(graph)
         with autocast(device_type=self.device.type, enabled=self.amp):
-            if self.noise_type == "pushforward":
-                pred, aux_loss = self.pushforward_pass(graph)
-            else:
-                pred = self.model(graph.x, graph.edge_attr, graph)
-                aux_loss = 0.0
-
-            mse_loss = self.criterion(pred, graph.y)
-            total_loss = mse_loss + aux_loss
-
+            total_loss = 0
+            num_chunks = 0
+            for subgraph in self.chunk_graph(graph):
+                pred = self.model(subgraph.x, subgraph.edge_attr, subgraph)
+                loss = self.criterion(pred, subgraph.y)
+                total_loss += loss
+                num_chunks += 1
+            total_loss = total_loss / max(num_chunks, 1)
+            loss_dict = {
+                "total_loss": total_loss.detach()
+            }
             loss_dict = {
                 "mse_loss": mse_loss.detach(),
                 "aux_loss": torch.tensor(aux_loss).detach()

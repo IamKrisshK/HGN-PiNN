@@ -2,16 +2,16 @@ import torch
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+import mopper.Mopper
 
 class trainer:
-    def __init__(self, cfg, model, dataloader, dist, logger):
+    def __init__(self, cfg, model, dataloader, dist, logger, wrapper):
         self.cfg = cfg
         self.model = model
         self.dataloader = dataloader
         self.dist = dist
         self.logger = logger
-
+        self.wrapper = wrapper
         self.device = dist.device
         self.amp = cfg.amp
 
@@ -44,11 +44,8 @@ class trainer:
 
     def step(self, batch):
         self.optimizer.zero_grad(set_to_none=True)
-
         loss, loss_dict = self.forward_step(batch)
-
         self.backward(loss)
-
         return loss.detach(), loss_dict
 
     def forward_step(self, batch):
@@ -60,7 +57,8 @@ class trainer:
             physics = None
 
         graph = graph.to(self.device)
-
+        if hasattr(self, "wrapper"):
+            graph = self.wrapper.apply_fourier(graph)
         with autocast(device_type=self.device.type, enabled=self.amp):
             if self.noise_type == "pushforward":
                 pred, aux_loss = self.pushforward_pass(graph)
@@ -87,10 +85,8 @@ class trainer:
         return total_loss, loss_dict
     def pushforward_pass(self, graph):
         X = graph.x
-
         n_static = 12
         n_time = (X.shape[1] - n_static) // 2
-
         static = X[:, :n_static]
         depth = X[:, n_static : n_static + n_time]
         volume = X[:, n_static + n_time :]

@@ -42,7 +42,7 @@ class Mopper:
             self.fourier_dim = cfg.fourier_dim
             self.fourier_scale = cfg.fourier_scale
             #2 dims = spatial coords
-            self.coord_dim = cfg.get("coord_dim", 2)
+            self.coord_dim = cfg.get("coord_dim", 12)
             self.fourier = FourierFeatureEncoder(
                 in_dim=self.coord_dim,
                 mapping_size=self.fourier_dim,

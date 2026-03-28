@@ -51,11 +51,15 @@ class Mopper:
     def apply_fourier(self, graph):
         if not self.use_fourier:
             return graph
+        if hasattr(graph, "x_fourier"):
+            graph.x = graph.x_fourier
+            return graph
         x = graph.x
         coords = x[:, :self.coord_dim]
         rest = x[:, self.coord_dim:]
         coords_encoded = self.fourier(coords)
-        graph.x = torch.cat([coords_encoded, rest], dim=-1)
+        graph.x_fourier = torch.cat([coords_encoded, rest], dim=-1)
+        graph.x = graph.x_fourier
         return graph
     def build_dataloader(self):
         self.logger.info("Initializing dataset...")

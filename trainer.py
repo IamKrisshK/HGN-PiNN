@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
-import mopper.Mopper
+from mopper import Mopper
 
 class trainer:
     def __init__(self, cfg, model, dataloader, dist, logger, wrapper):

@@ -1,16 +1,15 @@
 import torch
+import os
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from mopper import Mopper
-
-class trainer:
-    def __init__(self, cfg, model, dataloader, dist, logger, wrapper):
+class Trainer:
+    def __init__(self, cfg, model, dataloader, dist, wrapper):
         self.cfg = cfg
         self.model = model
         self.dataloader = dataloader
         self.dist = dist
-        self.logger = logger
         self.wrapper = wrapper
         self.device = dist.device
         self.amp = cfg.amp
@@ -41,6 +40,8 @@ class trainer:
 
         self.model.to(self.device)
         self.model.train()
+    def info(self, msg):
+        print(msg)
     def chunk_graph(self, graph, chunk_size=5000):
         N = graph.num_nodes
     
@@ -57,8 +58,8 @@ class trainer:
             graph = batch
             physics = None
     
+        graph = graph.to(self.device, non_blocking=True)
         graph = self.wrapper.apply_fourier(graph)
-        graph = graph.to(self.device)
     
         total_loss = 0.0
         loss_dict = {}
@@ -67,6 +68,9 @@ class trainer:
             with autocast(device_type=self.device.type, enabled=self.amp):
                 pred = self.model(subgraph.x, getattr(subgraph, "edge_attr", None), subgraph)
                 loss = self.criterion(pred, subgraph.y)
+                if self.cfg.get("use_pushforward", False):
+                    _, stab_loss = self.pushforward_pass(subgraph)
+                    loss = loss + self.cfg.get("pushforward_weight", 0.1) * stab_loss
                 if self.use_physics and physics is not None:
                     phy_loss = self.compute_physics(pred, physics, subgraph)
                     loss += self.physics_weight * phy_loss
@@ -79,7 +83,9 @@ class trainer:
         
     def pushforward_pass(self, graph):
         X = graph.x
-        n_static = 12
+        n_static = self.cfg.get("n_static_features", 12)
+        if self.wrapper.use_fourier:
+            n_static = 2 * self.wrapper.fourier_dim + (n_static - self.wrapper.coord_dim)
         n_time = (X.shape[1] - n_static) // 2
         static = X[:, :n_static]
         depth = X[:, n_static : n_static + n_time]
@@ -144,13 +150,13 @@ class trainer:
 
         torch.save(state, ckpt_path)
         if self.dist.rank == 0:
-            self.logger.info(f"Checkpoint saved at {ckpt_path}")
+            self.info(f"Checkpoint saved at {ckpt_path}")
     def load_checkpoint(self, ckpt_path=None):
         """Load model + optimizer + scaler + scheduler states."""
         if ckpt_path is None:
             ckpt_path = getattr(self.cfg, "ckpt_path", None)
         if ckpt_path is None or not os.path.exists(ckpt_path):
-            self.logger.info("No checkpoint found, starting from scratch.")
+            self.info("No checkpoint found, starting from scratch.")
             return 0
 
         state = torch.load(ckpt_path, map_location=self.device)
@@ -160,12 +166,13 @@ class trainer:
         self.scheduler.load_state_dict(state["scheduler_state_dict"])
         self.scaler.load_state_dict(state["scaler_state_dict"])
 
-        self.logger.info(f"Checkpoint loaded from epoch {state['epoch']}")
+        self.info(f"Checkpoint loaded from epoch {state['epoch']}")
         return state["epoch"] + 1
-    def train_epochs(self, start_epoch=0, end_epoch=None):
+    def train(self, start_epoch=0, end_epoch=None):
         if end_epoch is None:
             end_epoch = self.cfg.epochs
         for epoch in range(start_epoch, end_epoch):
+            self.dataloader.sampler.set_epoch(epoch)
             total = 0.0
             count = 0
             for step_idx, batch in enumerate(self.dataloader):
@@ -174,7 +181,5 @@ class trainer:
                 count += 1
             avg = total / max(count, 1)
             if self.dist.rank == 0:
-                self.logger.info(f"Epoch {epoch} | Loss: {avg:.4e}")
-            self.scheduler.step()
-            if self.dist.rank == 0:
+                self.info(f"Epoch {epoch} | Loss: {avg:.4e}")
                 self.save_checkpoint(epoch)

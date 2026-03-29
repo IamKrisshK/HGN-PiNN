@@ -29,11 +29,9 @@ def collate_fn(batch):
         return pyg.data.Batch.from_data_list(batch)
 
 class Mopper:
-    def __init__(self, cfg, dist, logger):
+    def __init__(self, cfg, dist):
         self.cfg = cfg
         self.dist = dist
-        self.logger = logger
-
         self.device = dist.device
         self.use_physics = cfg.get("use_physics_loss", False)
         self.use_fourier = cfg.get("use_fourier", False)
@@ -48,6 +46,8 @@ class Mopper:
                 mapping_size=self.fourier_dim,
                 scale=self.fourier_scale,
             ).to(self.device)
+    def info(self, msg):
+        print(msg)
     def apply_fourier(self, graph):
         if not self.use_fourier:
             return graph
@@ -62,7 +62,7 @@ class Mopper:
         graph.x = graph.x_fourier
         return graph
     def build_dataloader(self):
-        self.logger.info("Initializing dataset...")
+        self.info("Initializing dataset...")
         dataset = HydroGraphDataset(
             name="hydrograph_dataset",
             data_dir=self.cfg.data_dir,
@@ -84,21 +84,31 @@ class Mopper:
             num_replicas=self.dist.world_size,
             rank=self.dist.rank,
         )
+        if self.cfg.num_dataloader_workers:
+            dataloader = PyGDataLoader(
+                dataset,
+                batch_size=self.cfg.batch_size,
+                sampler=sampler,
+                num_workers=self.cfg.num_dataloader_workers,
+                pin_memory=True,
+                persistent_workers=True,
+                collate_fn=collate_fn,
+            )
+        else:
+            dataloader = PyGDataLoader(
+                dataset,
+                batch_size=self.cfg.batch_size,
+                sampler=sampler,
+                num_workers=0,
+                pin_memory=True,
+                persistent_workers=False,
+                collate_fn=collate_fn,
+            )
 
-        dataloader = PyGDataLoader(
-            dataset,
-            batch_size=self.cfg.batch_size,
-            sampler=sampler,
-            num_workers=self.cfg.num_dataloader_workers,
-            pin_memory=True,
-            persistent_workers=True,
-            collate_fn=collate_fn,
-        )
-
-        self.logger.info("Dataloader ready.")
+        self.info("Dataloader ready.")
         return dataloader
     def build_model(self):
-        self.logger.info("Building MeshGraphKAN model...")
+        self.info("Building MeshGraphKAN model...")
 
         mlp_act = "silu" if self.cfg.recompute_activation else "relu"
         input_dim = self.cfg.num_input_features
@@ -121,10 +131,10 @@ class Mopper:
 
         model = model.to(self.device)
 
-        self.logger.info("Model ready.")
+        self.info("Model ready.")
         return model
     def load_checkpoint(self, model, optimizer=None, scheduler=None, scaler=None):
-        self.logger.info("Loading checkpoint...")
+        self.info("Loading checkpoint...")
         if self.dist.world_size > 1:
             torch.distributed.barrier()
         epoch = load_checkpoint(
@@ -136,7 +146,7 @@ class Mopper:
             device=self.device,
         )
 
-        self.logger.info(f"Checkpoint loaded from epoch {epoch}")
+        self.info(f"Checkpoint loaded from epoch {epoch}")
         return epoch
     def build_all(self, optimizer=None, scheduler=None, scaler=None):
         dataloader = self.build_dataloader()

@@ -41,20 +41,6 @@ class trainer:
 
         self.model.to(self.device)
         self.model.train()
-
-    def step(self, batch, step_idx):
-        if step_idx % self.cfg["grad_accum_steps"] == 0:
-            self.optimizer.zero_grad(set_to_none=True)
-        loss, loss_dict = self.forward_step(batch)
-        loss = loss / self.cfg["grad_accum_steps"]
-        self.backward(loss)
-        if (step_idx + 1) % self.cfg["grad_accum_steps"] == 0:
-            if self.amp:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-        return loss.detach(), loss_dict
     def chunk_graph(self, graph, chunk_size=5000):
         N = graph.num_nodes
     
@@ -70,36 +56,27 @@ class trainer:
         else:
             graph = batch
             physics = None
-
-        graph = graph.to(self.device, non_blocking=True)
-        if hasattr(self, "wrapper"):
-            graph = self.wrapper.apply_fourier(graph)
-        with autocast(device_type=self.device.type, enabled=self.amp):
-            total_loss = 0
-            num_chunks = 0
-            for subgraph in self.chunk_graph(graph):
-                pred = self.model(subgraph.x, subgraph.edge_attr, subgraph)
+    
+        graph = self.wrapper.apply_fourier(graph)
+        graph = graph.to(self.device)
+    
+        total_loss = 0.0
+        loss_dict = {}
+        num_chunks = 0
+        for subgraph in self.chunk_graph(graph, chunk_size=self.cfg.get("chunk_size", 5000)):
+            with autocast(device_type=self.device.type, enabled=self.amp):
+                pred = self.model(subgraph.x, getattr(subgraph, "edge_attr", None), subgraph)
                 loss = self.criterion(pred, subgraph.y)
+                if self.use_physics and physics is not None:
+                    phy_loss = self.compute_physics(pred, physics, subgraph)
+                    loss += self.physics_weight * phy_loss
+                    loss_dict[f"physics_loss_chunk_{num_chunks}"] = phy_loss.detach()
                 total_loss += loss
-                num_chunks += 1
-            total_loss = total_loss / max(num_chunks, 1)
-            loss_dict = {
-                "total_loss": total_loss.detach()
-            }
-            loss_dict = {
-                "mse_loss": mse_loss.detach(),
-                "aux_loss": torch.tensor(aux_loss).detach()
-                if not isinstance(aux_loss, torch.Tensor)
-                else aux_loss.detach(),
-            }
-            if self.use_physics and physics is not None:
-                phy_loss = self.compute_physics(pred, physics, graph)
-                total_loss += self.physics_weight * phy_loss
-                loss_dict["physics_loss"] = phy_loss.detach()
-
-            loss_dict["total_loss"] = total_loss.detach()
-
+            num_chunks += 1
+        total_loss /= max(num_chunks, 1)
+        loss_dict["total_loss"] = total_loss.detach()
         return total_loss, loss_dict
+        
     def pushforward_pass(self, graph):
         X = graph.x
         n_static = 12
@@ -127,28 +104,77 @@ class trainer:
 
         return compute_physics_loss(
             pred, physics, graph, delta_t=self.delta_t
-        )
+            )
     def backward(self, loss):
         if self.amp:
             self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
         else:
             loss.backward()
-            self.optimizer.step()
-    def train_epochs(self, epochs):
-        for epoch in range(epochs):
+    
+    def step(self, batch, step_idx):
+        if step_idx % self.cfg.get("grad_accum_steps", 1) == 0:
+            self.optimizer.zero_grad(set_to_none=True)
+    
+        loss, loss_dict = self.forward_step(batch)
+        loss = loss / self.cfg.get("grad_accum_steps", 1)
+        self.backward(loss)
+    
+        if (step_idx + 1) % self.cfg.get("grad_accum_steps", 1) == 0:
+            if self.amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            self.scheduler.step()
+    
+        return loss.detach(), loss_dict
+    def save_checkpoint(self, epoch, ckpt_path=None):
+        """Save model + optimizer + scaler + scheduler states."""
+        if ckpt_path is None:
+            ckpt_path = getattr(self.cfg, "ckpt_path", "checkpoint.pt")
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+
+        state = {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+        }
+
+        torch.save(state, ckpt_path)
+        if self.dist.rank == 0:
+            self.logger.info(f"Checkpoint saved at {ckpt_path}")
+    def load_checkpoint(self, ckpt_path=None):
+        """Load model + optimizer + scaler + scheduler states."""
+        if ckpt_path is None:
+            ckpt_path = getattr(self.cfg, "ckpt_path", None)
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            self.logger.info("No checkpoint found, starting from scratch.")
+            return 0
+
+        state = torch.load(ckpt_path, map_location=self.device)
+
+        self.model.load_state_dict(state["model_state_dict"])
+        self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        self.scheduler.load_state_dict(state["scheduler_state_dict"])
+        self.scaler.load_state_dict(state["scaler_state_dict"])
+
+        self.logger.info(f"Checkpoint loaded from epoch {state['epoch']}")
+        return state["epoch"] + 1
+    def train_epochs(self, start_epoch=0, end_epoch=None):
+        if end_epoch is None:
+            end_epoch = self.cfg.epochs
+        for epoch in range(start_epoch, end_epoch):
             total = 0.0
             count = 0
-
-            for batch in self.dataloader:
-                loss, _ = self.step(batch)
+            for step_idx, batch in enumerate(self.dataloader):
+                loss, loss_dict = self.step(batch, step_idx)
                 total += loss.item()
                 count += 1
-
             avg = total / max(count, 1)
-
             if self.dist.rank == 0:
                 self.logger.info(f"Epoch {epoch} | Loss: {avg:.4e}")
-
             self.scheduler.step()
+            if self.dist.rank == 0:
+                self.save_checkpoint(epoch)

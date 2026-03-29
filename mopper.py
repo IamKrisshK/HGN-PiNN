@@ -21,12 +21,12 @@ class FourierFeatureEncoder(nn.Module):
 def collate_fn(batch):
     if isinstance(batch[0], tuple):
         graphs, physics = zip(*batch)
-        physics_d = {}
-        for key in physics[0].keys():
-            physics_d[key] = torch.tensor([p[key] for p in physics])
-        return pyg.data.Batch.from_data_list(graphs), physics_d
-    else:
-        return pyg.data.Batch.from_data_list(batch)
+        physics_d = {
+            key: torch.stack([torch.as_tensor(p[key]) for p in physics])
+            for key in physics[0].keys()
+        }
+        return pyg.data.Batch.from_data_list(list(graphs)), physics_d
+    return pyg.data.Batch.from_data_list(list(graphs))
 
 class Mopper:
     def __init__(self, cfg, dist):
@@ -51,15 +51,9 @@ class Mopper:
     def apply_fourier(self, graph):
         if not self.use_fourier:
             return graph
-        if hasattr(graph, "x_fourier"):
-            graph.x = graph.x_fourier
-            return graph
         x = graph.x
-        coords = x[:, :self.coord_dim]
-        rest = x[:, self.coord_dim:]
-        coords_encoded = self.fourier(coords)
-        graph.x_fourier = torch.cat([coords_encoded, rest], dim=-1)
-        graph.x = graph.x_fourier
+        x_proj = (2 * math.pi * x[:, :self.coord_dim]) @ self.fourier.B
+        graph.x = torch.cat([x_proj.sin(), x_proj.cos(), x[:, self.coord_dim:]], dim=-1)
         return graph
     def build_dataloader(self):
         self.info("Initializing dataset...")
